@@ -1,9 +1,12 @@
 import asyncio
+import html
 import json
 import logging
 import os
 import random
 import re
+import secrets
+import urllib.request
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -25,6 +28,9 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN fehlt.")
+
+KIE_API_KEY = os.getenv("KIE_API_KEY")
+KIE_API_URL = "https://api.kie.ai/gemini-3-5-flash-openai/v1/chat/completions"
 
 dp = Dispatcher()
 
@@ -403,6 +409,7 @@ TASK_LABELS = {
 }
 
 SESSIONS = {}
+AI_CONTEXTS = {}
 
 
 def get_data_file() -> Path:
@@ -461,17 +468,85 @@ def menu_markup() -> InlineKeyboardMarkup:
     )
 
 
-def next_markup(mode: str, has_more: bool = True) -> InlineKeyboardMarkup:
+def next_markup(
+    mode: str,
+    has_more: bool = True,
+    ai_request_id: str | None = None,
+) -> InlineKeyboardMarkup:
     if mode == "review":
         label = "Nächste Wiederholung" if has_more else "Zum Menü"
     else:
         label = "Weiter"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows = []
+    if ai_request_id:
+        rows.append(
+            [InlineKeyboardButton(text="KI-Erklärung", callback_data=f"ai:{ai_request_id}")]
+        )
+    rows.extend(
+        [
             [InlineKeyboardButton(text=label, callback_data="flow:next")],
             [InlineKeyboardButton(text="Training beenden", callback_data="menu:home")],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def plain_text(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+async def create_ai_explanation(context: dict) -> str:
+    if not KIE_API_KEY:
+        raise RuntimeError("KIE_API_KEY fehlt.")
+
+    prompt = (
+        f"Verb: {context['verb']}\n"
+        f"Aufgabentyp: {context['task']}\n"
+        f"Antwort der lernenden Person: {context['user_answer']}\n"
+        f"Richtige Lösung: {context['correct_answer']}\n\n"
+        "Erkläre den Fehler auf Deutsch in zwei bis drei kurzen Sätzen auf Niveau A2–B1. "
+        "Nenne danach genau einen neuen Beispielsatz mit demselben Verb. "
+        "Keine Übersetzung, keine Überschrift und keine Markdown-Zeichen."
+    )
+    payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Du bist eine freundliche, präzise Deutschlehrkraft. "
+                    "Erkläre nur den konkreten Grammatikfehler und erfinde keine Regeln."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 180,
+        "stream": False,
+    }
+
+    def request_explanation() -> str:
+        request = urllib.request.Request(
+            KIE_API_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {KIE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=35) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        content = result["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "") for item in content if isinstance(item, dict)
+            )
+        explanation = str(content).strip()
+        if not explanation:
+            raise RuntimeError("Leere KI-Antwort.")
+        return explanation
+
+    return await asyncio.to_thread(request_explanation)
 
 
 async def show_menu(message: Message) -> None:
@@ -749,21 +824,60 @@ async def start_review(message: Message, user_id: int) -> None:
     await render_step(message, user_id)
 
 
-async def send_result(message: Message, user_id: int, correct: bool, correct_text: str) -> None:
+async def send_result(
+    message: Message,
+    user_id: int,
+    correct: bool,
+    correct_text: str,
+    user_answer: str = "",
+) -> None:
     session = SESSIONS[user_id]
     task = session["task"]
     verb_key = session["verb"]
     variant = int(session.get("variant", 0))
     register_result(user_id, correct, task, verb_key, variant)
     session["round_total"] += 1
+    ai_request_id = None
     if correct:
         session["round_correct"] += 1
         text = "<b>Richtig.</b>"
     else:
         text = f"<b>Noch nicht.</b>\n\nRichtig: {correct_text}\n\nDiese Form kommt in die Wiederholung."
+        if KIE_API_KEY:
+            ai_request_id = secrets.token_hex(4)
+            AI_CONTEXTS[(user_id, ai_request_id)] = {
+                "verb": verb_key,
+                "task": TASK_LABELS[task],
+                "user_answer": plain_text(user_answer) or "keine Antwort",
+                "correct_answer": plain_text(correct_text),
+            }
     has_more = bool(user_stats(user_id)["mistakes"])
     session["awaiting"] = None
-    await message.answer(text, reply_markup=next_markup(session["mode"], has_more))
+    await message.answer(
+        text,
+        reply_markup=next_markup(session["mode"], has_more, ai_request_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("ai:"))
+async def ai_explanation_callback(callback: CallbackQuery) -> None:
+    request_id = callback.data.split(":", 1)[1]
+    context = AI_CONTEXTS.pop((callback.from_user.id, request_id), None)
+    if not context:
+        await callback.answer("Diese Erklärung ist nicht mehr verfügbar.", show_alert=True)
+        return
+    await callback.answer("Die KI-Erklärung wird erstellt.")
+    await callback.message.answer("Einen Moment …")
+    try:
+        explanation = await create_ai_explanation(context)
+        await callback.message.answer(
+            f"<b>KI-Erklärung</b>\n\n{html.escape(explanation)}"
+        )
+    except Exception:
+        logging.exception("Die KI-Erklärung konnte nicht erstellt werden.")
+        await callback.message.answer(
+            "Die KI-Erklärung ist gerade nicht verfügbar. Bitte versuche es später noch einmal."
+        )
 
 
 @dp.message(CommandStart())
@@ -795,6 +909,7 @@ async def help_command(message: Message) -> None:
         "<b>So funktioniert das Training</b>\n\n"
         "Jede Runde beginnt mit einer Formenkarte. Danach löst du sechs kurze Aufgaben. "
         "Falsche Formen werden gespeichert und später mit einem anderen Satz wiederholt. "
+        "Nach einer falschen Antwort kann dir die KI den Fehler kurz erklären. "
         "Antworte bei Texteingaben nur mit der verlangten Verbform.",
         reply_markup=menu_markup(),
     )
@@ -828,6 +943,8 @@ async def privacy_command(message: Message) -> None:
     await message.answer(
         "Gespeichert werden nur deine Telegram-ID, die Anzahl richtiger und falscher Antworten "
         "sowie offene Wiederholungen. Freie Nachrichten werden nicht gespeichert. "
+        "Wenn du eine KI-Erklärung anforderst, werden nur die Aufgabe, deine Antwort und die "
+        "richtige Lösung an Kie.ai übermittelt. Dein Name und deine Telegram-ID werden nicht übermittelt. "
         "Mit /reset löschst du deinen Lernfortschritt."
     )
 
@@ -936,7 +1053,13 @@ async def check_form_callback(callback: CallbackQuery) -> None:
     answer = " → ".join(session["target"])
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await send_result(callback.message, user_id, correct, answer)
+    await send_result(
+        callback.message,
+        user_id,
+        correct,
+        answer,
+        " → ".join(selected_forms),
+    )
 
 
 @dp.callback_query(F.data.startswith("choice:"))
@@ -951,7 +1074,13 @@ async def choice_callback(callback: CallbackQuery) -> None:
     correct = normalize(answer) == normalize(session["answer"])
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await send_result(callback.message, user_id, correct, f"<b>{session['answer']}</b>")
+    await send_result(
+        callback.message,
+        user_id,
+        correct,
+        f"<b>{session['answer']}</b>",
+        answer,
+    )
 
 
 @dp.callback_query(F.data.startswith("word:"))
@@ -1010,7 +1139,13 @@ async def check_word_callback(callback: CallbackQuery) -> None:
     answer = " ".join(session["target"])
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await send_result(callback.message, user_id, correct, f"<i>{answer}</i>")
+    await send_result(
+        callback.message,
+        user_id,
+        correct,
+        f"<i>{answer}</i>",
+        " ".join(selected_words),
+    )
 
 
 @dp.message()
@@ -1028,6 +1163,7 @@ async def text_answer(message: Message) -> None:
             user_id,
             correct,
             f"<b>{session['answer']}</b>\n<i>{session['correct_sentence']}</i>",
+            message.text or "",
         )
         return
 
@@ -1036,7 +1172,7 @@ async def text_answer(message: Message) -> None:
         expected = [normalize(answer) for answer in session["answers"]]
         correct = parts == expected
         answer_text = " · ".join(f"<b>{answer}</b>" for answer in session["answers"])
-        await send_result(message, user_id, correct, answer_text)
+        await send_result(message, user_id, correct, answer_text, message.text or "")
         return
 
     await message.answer("Bitte benutze die Schaltflächen unter der Aufgabe.")

@@ -462,6 +462,7 @@ def menu_markup() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Training starten", callback_data="menu:train")],
             [InlineKeyboardButton(text="Fehler wiederholen", callback_data="menu:review")],
+            [InlineKeyboardButton(text="KI fragen", callback_data="menu:ask_ai")],
             [InlineKeyboardButton(text="Fortschritt", callback_data="menu:progress")],
             [InlineKeyboardButton(text="So funktioniert es", callback_data="menu:help")],
         ]
@@ -547,6 +548,56 @@ async def create_ai_explanation(context: dict) -> str:
         return explanation
 
     return await asyncio.to_thread(request_explanation)
+
+
+async def create_ai_answer(question: str) -> str:
+    if not KIE_API_KEY:
+        raise RuntimeError("KIE_API_KEY fehlt.")
+
+    payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Du bist ein Lernassistent für Deutsch auf Niveau A2–B1. "
+                    "Beantworte nur Fragen zur deutschen Sprache, besonders zu Verben, "
+                    "Verbformen, Zeiten, Wortstellung und Wortschatz. Antworte in der Sprache "
+                    "der Frage: auf Russisch bei einer russischen Frage und in einfachem Deutsch "
+                    "bei einer deutschen Frage. Erkläre kurz und gib ein korrektes deutsches Beispiel. "
+                    "Wenn die Frage nichts mit Deutschlernen zu tun hat, sage freundlich, dass du nur "
+                    "Fragen zur deutschen Sprache beantwortest. Verwende keine Markdown-Zeichen."
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 260,
+        "stream": False,
+    }
+
+    def request_answer() -> str:
+        request = urllib.request.Request(
+            KIE_API_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {KIE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=35) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        content = result["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "") for item in content if isinstance(item, dict)
+            )
+        answer = str(content).strip()
+        if not answer:
+            raise RuntimeError("Leere KI-Antwort.")
+        return answer
+
+    return await asyncio.to_thread(request_answer)
 
 
 async def show_menu(message: Message) -> None:
@@ -910,8 +961,20 @@ async def help_command(message: Message) -> None:
         "Jede Runde beginnt mit einer Formenkarte. Danach löst du sechs kurze Aufgaben. "
         "Falsche Formen werden gespeichert und später mit einem anderen Satz wiederholt. "
         "Nach einer falschen Antwort kann dir die KI den Fehler kurz erklären. "
+        "Über «KI fragen» kannst du eine eigene Frage zu einem Verb oder zur Grammatik stellen. "
         "Antworte bei Texteingaben nur mit der verlangten Verbform.",
         reply_markup=menu_markup(),
+    )
+
+
+@dp.message(Command("frage"))
+async def question_command(message: Message) -> None:
+    user_id = message.from_user.id
+    SESSIONS[user_id] = {"mode": "ai_question", "awaiting": "ai_question"}
+    await message.answer(
+        "<b>Frage an die KI</b>\n\n"
+        "Stelle eine Frage zu einem deutschen Verb oder zur Grammatik. "
+        "Du kannst auf Deutsch oder Russisch schreiben."
     )
 
 
@@ -945,6 +1008,7 @@ async def privacy_command(message: Message) -> None:
         "sowie offene Wiederholungen. Freie Nachrichten werden nicht gespeichert. "
         "Wenn du eine KI-Erklärung anforderst, werden nur die Aufgabe, deine Antwort und die "
         "richtige Lösung an Kie.ai übermittelt. Dein Name und deine Telegram-ID werden nicht übermittelt. "
+        "Bei «KI fragen» wird nur der Text deiner Frage an Kie.ai übermittelt. "
         "Mit /reset löschst du deinen Lernfortschritt."
     )
 
@@ -968,6 +1032,18 @@ async def train_callback(callback: CallbackQuery) -> None:
 async def review_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     await start_review(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "menu:ask_ai")
+async def ask_ai_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    SESSIONS[user_id] = {"mode": "ai_question", "awaiting": "ai_question"}
+    await callback.answer()
+    await callback.message.answer(
+        "<b>Frage an die KI</b>\n\n"
+        "Stelle eine Frage zu einem deutschen Verb oder zur Grammatik. "
+        "Du kannst auf Deutsch oder Russisch schreiben."
+    )
 
 
 @dp.callback_query(F.data == "menu:progress")
@@ -1156,6 +1232,36 @@ async def text_answer(message: Message) -> None:
         await message.answer("Bitte wähle eine Funktion im Menü.", reply_markup=menu_markup())
         return
 
+    if session["awaiting"] == "ai_question":
+        question = (message.text or "").strip()
+        if not question:
+            await message.answer("Bitte schreibe eine Frage als Text.")
+            return
+        if len(question) > 500:
+            await message.answer("Bitte formuliere die Frage kürzer als 500 Zeichen.")
+            return
+        SESSIONS.pop(user_id, None)
+        await message.answer("Einen Moment …")
+        try:
+            answer = await create_ai_answer(question)
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Noch eine Frage", callback_data="menu:ask_ai")],
+                    [InlineKeyboardButton(text="Zum Menü", callback_data="menu:home")],
+                ]
+            )
+            await message.answer(
+                f"<b>Antwort der KI</b>\n\n{html.escape(answer)}",
+                reply_markup=markup,
+            )
+        except Exception:
+            logging.exception("Die KI-Frage konnte nicht beantwortet werden.")
+            await message.answer(
+                "Die KI ist gerade nicht verfügbar. Bitte versuche es später noch einmal.",
+                reply_markup=menu_markup(),
+            )
+        return
+
     if session["awaiting"] == "error_text":
         correct = normalize(message.text or "") == normalize(session["answer"])
         await send_result(
@@ -1185,6 +1291,7 @@ async def set_commands(bot: Bot) -> None:
             BotCommand(command="training", description="Neue Trainingsrunde"),
             BotCommand(command="wiederholen", description="Fehler wiederholen"),
             BotCommand(command="fortschritt", description="Lernfortschritt anzeigen"),
+            BotCommand(command="frage", description="Eine Frage an die KI stellen"),
             BotCommand(command="hilfe", description="Anleitung anzeigen"),
             BotCommand(command="datenschutz", description="Gespeicherte Daten"),
             BotCommand(command="reset", description="Lernfortschritt löschen"),

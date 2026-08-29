@@ -1,3 +1,4 @@
+# VERSION: AI-SATZPRUEFUNG-2026-08-29
 import asyncio
 import html
 import json
@@ -406,6 +407,7 @@ TASK_LABELS = {
     "perf_order": "Perfekt",
     "error": "Fehler finden",
     "fill": "Drei Zeiten",
+    "own_sentence": "Eigener Satz",
 }
 
 SESSIONS = {}
@@ -600,6 +602,105 @@ async def create_ai_answer(question: str) -> str:
     return await asyncio.to_thread(request_answer)
 
 
+def parse_ai_json(content: object) -> dict:
+    if isinstance(content, list):
+        content = "".join(
+            item.get("text", "") for item in content if isinstance(item, dict)
+        )
+    text = str(content).strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        raise RuntimeError("Ungültige KI-Antwort.")
+    result = json.loads(match.group(0))
+    if not isinstance(result.get("is_correct"), bool):
+        raise RuntimeError("KI-Bewertung fehlt.")
+    feedback = str(result.get("feedback", "")).strip()
+    if not feedback:
+        raise RuntimeError("KI-Feedback fehlt.")
+    return {
+        "is_correct": result["is_correct"],
+        "feedback": feedback,
+        "corrected_sentence": str(result.get("corrected_sentence", "")).strip(),
+    }
+
+
+async def check_own_sentence(
+    verb_key: str,
+    tense: str,
+    sentence: str,
+) -> dict:
+    if not KIE_API_KEY:
+        raise RuntimeError("KIE_API_KEY fehlt.")
+
+    verb = VERBS[verb_key]
+    prompt = (
+        f"Infinitiv: {verb_key}\n"
+        f"Präteritum: {verb['praeteritum']}\n"
+        f"Perfekt: {verb['aux']} {verb['partizip']}\n"
+        f"Geforderte Zeitform: {tense}\n"
+        f"Satz der lernenden Person: {sentence}\n\n"
+        "Prüfe, ob der Satz vollständig und inhaltlich verständlich ist, ob das angegebene "
+        "Verb korrekt verwendet wird und ob die geforderte Zeitform stimmt. Berücksichtige "
+        "auch Verbform, Hilfsverb und Wortstellung. Kleine Zeichensetzungsfehler allein machen "
+        "den Satz nicht falsch. Gib ausschließlich ein JSON-Objekt in diesem Format zurück: "
+        '{"is_correct": true, "feedback": "...", "corrected_sentence": "..."}. '
+        "Das Feedback besteht aus höchstens drei kurzen Sätzen auf Deutsch auf Niveau A2–B1. "
+        "Wenn der Satz korrekt ist, lobe konkret und lasse corrected_sentence leer. "
+        "Wenn er falsch ist, erkläre nur die konkreten Fehler und gib in corrected_sentence "
+        "eine korrekte Fassung an. Keine Übersetzung und keine Markdown-Zeichen."
+    )
+    payload = {
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Du bist eine präzise und freundliche Deutschlehrkraft. "
+                    "Bewerte nur den vorliegenden Satz und halte dich streng an das JSON-Format."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 220,
+        "stream": False,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "sentence_feedback",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "is_correct": {"type": "boolean"},
+                        "feedback": {"type": "string"},
+                        "corrected_sentence": {"type": "string"},
+                    },
+                    "required": ["is_correct", "feedback", "corrected_sentence"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+
+    def request_check() -> dict:
+        request = urllib.request.Request(
+            KIE_API_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {KIE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=35) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return parse_ai_json(result["choices"][0]["message"]["content"])
+
+    return await asyncio.to_thread(request_check)
+
+
 async def show_menu(message: Message) -> None:
     await message.answer(
         "<b>Drei Formen | Deutschtrainer</b>\n\n"
@@ -660,7 +761,10 @@ async def show_card(message: Message, session: dict) -> None:
         f"Perfekt: <i>{verb['examples'][2]}</i>"
     )
     markup = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Übungen starten", callback_data="flow:next")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Übungen starten", callback_data="flow:next")],
+            [InlineKeyboardButton(text="Eigenen Satz schreiben", callback_data="flow:own_sentence")],
+        ]
     )
     await message.answer(text, reply_markup=markup)
 
@@ -802,12 +906,30 @@ async def task_fill(message: Message, session: dict) -> None:
     )
 
 
+async def task_own_sentence(message: Message, session: dict, standalone: bool = False) -> None:
+    verb_key = session["verb"]
+    tense = random.choice(["Präsens", "Präteritum", "Perfekt"])
+    session.update(
+        task="own_sentence",
+        awaiting="own_sentence",
+        own_tense=tense,
+        own_attempts=0,
+        own_standalone=standalone,
+    )
+    title = "Dein eigener Satz" if standalone else "7. Dein eigener Satz"
+    await message.answer(
+        f"<b>{title}</b>\n\n"
+        f"Schreibe einen vollständigen Satz mit <b>{verb_key}</b> im <b>{tense}</b>.\n\n"
+        "Die KI prüft die Verbform, die Zeitform und den Satzbau."
+    )
+
+
 async def render_step(message: Message, user_id: int) -> None:
     session = SESSIONS[user_id]
     if session["mode"] == "review":
         task = session["task"]
     else:
-        tasks = ["forms", "present", "praet_order", "perf_order", "error", "fill"]
+        tasks = ["forms", "present", "praet_order", "perf_order", "error", "fill", "own_sentence"]
         if session["step"] >= len(tasks):
             await finish_round(message, user_id)
             return
@@ -824,6 +946,8 @@ async def render_step(message: Message, user_id: int) -> None:
         await task_error(message, session)
     elif task == "fill":
         await task_fill(message, session)
+    elif task == "own_sentence":
+        await task_own_sentence(message, session)
 
 
 async def finish_round(message: Message, user_id: int) -> None:
@@ -958,9 +1082,11 @@ async def progress_command(message: Message) -> None:
 async def help_command(message: Message) -> None:
     await message.answer(
         "<b>So funktioniert das Training</b>\n\n"
-        "Jede Runde beginnt mit einer Formenkarte. Danach löst du sechs kurze Aufgaben. "
+        "Jede Runde beginnt mit einer Formenkarte. Danach löst du sechs kurze Aufgaben und "
+        "schreibst einen eigenen Beispielsatz. "
         "Falsche Formen werden gespeichert und später mit einem anderen Satz wiederholt. "
         "Nach einer falschen Antwort kann dir die KI den Fehler kurz erklären. "
+        "Deinen eigenen Satz prüft die KI auf Verbform, Zeitform und Satzbau. "
         "Über «KI fragen» kannst du eine eigene Frage zu einem Verb oder zur Grammatik stellen. "
         "Antworte bei Texteingaben nur mit der verlangten Verbform.",
         reply_markup=menu_markup(),
@@ -1009,6 +1135,8 @@ async def privacy_command(message: Message) -> None:
         "Wenn du eine KI-Erklärung anforderst, werden nur die Aufgabe, deine Antwort und die "
         "richtige Lösung an Kie.ai übermittelt. Dein Name und deine Telegram-ID werden nicht übermittelt. "
         "Bei «KI fragen» wird nur der Text deiner Frage an Kie.ai übermittelt. "
+        "Bei einem eigenen Beispielsatz werden nur das Verb, die verlangte Zeitform und dein "
+        "Satz an Kie.ai übermittelt. "
         "Mit /reset löschst du deinen Lernfortschritt."
     )
 
@@ -1071,6 +1199,17 @@ async def next_callback(callback: CallbackQuery) -> None:
         return
     session["step"] += 1
     await render_step(callback.message, user_id)
+
+
+@dp.callback_query(F.data == "flow:own_sentence")
+async def own_sentence_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    session = SESSIONS.get(user_id)
+    await callback.answer()
+    if not session or "verb" not in session:
+        await show_menu(callback.message)
+        return
+    await task_own_sentence(callback.message, session, standalone=True)
 
 
 @dp.callback_query(F.data.startswith("form:"))
@@ -1260,6 +1399,68 @@ async def text_answer(message: Message) -> None:
                 "Die KI ist gerade nicht verfügbar. Bitte versuche es später noch einmal.",
                 reply_markup=menu_markup(),
             )
+        return
+
+    if session["awaiting"] == "own_sentence":
+        sentence = (message.text or "").strip()
+        if len(sentence) < 4:
+            await message.answer("Bitte schreibe einen vollständigen Satz.")
+            return
+        if len(sentence) > 300:
+            await message.answer("Bitte schreibe einen Satz mit höchstens 300 Zeichen.")
+            return
+
+        session["own_attempts"] = int(session.get("own_attempts", 0)) + 1
+        await message.answer("Dein Satz wird geprüft …")
+        try:
+            result = await check_own_sentence(
+                session["verb"],
+                session["own_tense"],
+                sentence,
+            )
+        except Exception:
+            logging.exception("Der eigene Satz konnte nicht geprüft werden.")
+            await message.answer(
+                "Die KI-Prüfung ist gerade nicht verfügbar. Dein Satz bleibt erhalten. "
+                "Bitte versuche es später noch einmal.",
+                reply_markup=menu_markup(),
+            )
+            return
+
+        feedback = html.escape(result["feedback"])
+        if result["is_correct"]:
+            session["awaiting"] = None
+            if session.get("own_standalone"):
+                markup = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="Zum Menü", callback_data="menu:home")]
+                    ]
+                )
+            else:
+                markup = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="Weiter", callback_data="flow:next")],
+                        [InlineKeyboardButton(text="Training beenden", callback_data="menu:home")],
+                    ]
+                )
+            await message.answer(
+                f"<b>Dein Satz ist richtig.</b>\n\n{feedback}",
+                reply_markup=markup,
+            )
+            return
+
+        correction = ""
+        if session["own_attempts"] >= 2 and result["corrected_sentence"]:
+            correction = (
+                "\n\n<b>Mögliche Korrektur:</b>\n"
+                f"<i>{html.escape(result['corrected_sentence'])}</i>"
+            )
+        await message.answer(
+            "<b>Noch nicht.</b>\n\n"
+            f"{feedback}{correction}\n\n"
+            f"Schreibe einen neuen Satz mit <b>{session['verb']}</b> "
+            f"im <b>{session['own_tense']}</b>."
+        )
         return
 
     if session["awaiting"] == "error_text":
